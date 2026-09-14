@@ -30,9 +30,9 @@ def nki_tp_all_reduce_kernel(input: nl.NkiTensor, replica_group: ReplicaGroup) -
 
     `input` is a 2D [P, F] tile. This is the canonical nki-library
     all_reduce_hbm_kernel over the WHOLE tensor — collective src/dst must be
-    freshly-allocated nl.shared_hbm WITH name= (else NCC_IBIR440 DRAM-alloc
-    failure), and a collective cannot read/write IO tensors directly, so the
-    input is staged in via dma_copy and the result copied back out.
+    freshly-allocated nl.shared_hbm WITH name=, and a collective cannot read/write
+    IO tensors directly, so the input is staged in via dma_copy and the result
+    copied back out.
 
     """
     src = nl.ndarray(input.shape, dtype=input.dtype, buffer=nl.shared_hbm, name="src")

@@ -12,24 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Configuration and host-side helpers shared across the DeepSeek-V4 CSA kernels.
-
-``CSAConfigFull`` is the production configuration: 128 query heads and 16 output
-projection groups. ``CSAConfig`` is the per-rank shard that the kernels actually
-see under 4-way head-parallel tensor parallelism -- 32 query heads and 4 output
-groups -- and is what ``shard_for_tp`` produces.
-
-The indexer fields (``index_*``) describe the lightning indexer that scores every
-compressed position; ``index_topk`` is how many of those positions the sparse
-attention gathers, so the attention body's cost is O(window_size + index_topk)
-and does not grow with the context length.
-
-The helpers below are plain torch, not NKI: the RoPE tables and window-bias masks
-are built once on the host and handed to the kernels as inputs, and ``RMSNorm`` /
-``hadamard_transform`` are used by the block composition and by the CPU
-references. Keeping them here is what lets the kernels, the blocks and the
-references agree bit-for-bit on the tables they consume.
-"""
+"""Configuration and host-side helpers shared across the DeepSeek-V4 CSA kernels."""
 
 import math
 from dataclasses import dataclass, replace
@@ -120,7 +103,7 @@ class CSAConfig:
 
 @dataclass
 class CSAConfigFull(CSAConfig):
-    """The production DeepSeek-V4-Pro-Max shape: 128 query heads, 16 output groups.
+    """The full unsharded shape: 128 query heads, 16 output groups.
 
     A whole chip holds this configuration as ``tp_size`` head-parallel ranks; each
     rank runs ``shard_for_tp(config, tp_size)`` on 2 logical NeuronCores.

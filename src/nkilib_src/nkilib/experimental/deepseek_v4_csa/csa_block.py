@@ -46,12 +46,6 @@ launch                                   grid     work
 Prefill instead calls the RMS+RoPE kernel three times (q, kv, output de-RoPE)
 around the compressor, indexer and the two sparse-attention kernels.
 
-Not covered by the integration tests
-------------------------------------
-The classes here interleave torch projections with NKI launches and, on the
-multi-worker path, span several ranks, so they are outside what the kernel test
-framework traces. The per-kernel numerics live in the integration tests; this
-module's own end-to-end check is ``main()`` against ``csa_block_torch``.
 """
 
 import os
@@ -75,7 +69,7 @@ from .csa_decode_attention import (
     NISA_TOPK_PARTITIONS,
     nisa_topk_snake_kernel,
     nki_decode_gather_ok_kernel,
-    nki_indexer_qproj_gemv,
+    nki_indexer_qproj_rope_had_gemv,
     nki_indexer_score_2core,
     nki_indexer_score_kernel,
     nki_indexer_score_topk_2core,
@@ -90,10 +84,10 @@ from .csa_prefill_attention import (
     nki_indexer_score_mask_kernel,
     nki_prefill_sparse_attn_kernel,
     nki_prefill_topk_kernel,
+    nki_qb_rms_rope_kernel,
     nki_rms_rope_kernel,
 )
 from .csa_tp_all_reduce import tp_all_gather_rows, tp_all_reduce
-
 
 _SPARSE_PREFILL_MODE = os.environ.get("CSA_SPARSE_PREFILL", "auto")
 _SPARSE_MIN_T_C = 4096
@@ -111,13 +105,6 @@ def sparse_prefill_q_range(seq_len: int, t_c: int, index_topk: int, ratio: int, 
     every rank's rows CONTIGUOUS lets the driver concatenate the partials instead of
     gathering them.
 
-    The row counts are equalised, though. Handing rank 0 the whole dense region on top
-    of a full share of the scored region gave it 11264 of 32768 rows against 7168 for
-    the others -- 1.57x the work on what is the tp4 critical path, since the ranks run
-    concurrently and the block finishes with the slowest. Rank 0 instead takes exactly
-    ``seq_len / tp_size`` rows (the dense region plus however much of the scored region
-    fills its share) and the remainder divides among the rest.
-
     Returns ``(lo, hi)`` half-open, in query positions.
     """
     del t_c, index_topk, ratio
@@ -127,6 +114,18 @@ def sparse_prefill_q_range(seq_len: int, t_c: int, index_topk: int, ratio: int, 
     share = (seq_len - per) // (tp_size - 1)
     lo = per + (tp_rank - 1) * share
     return lo, lo + share
+
+
+def _pack_qb_weight(w, heads: int, head_dim: int, pmax: int = 128):
+    """A ``wq_b`` weight ``[heads * head_dim, R]`` in ``nki_qb_rms_rope_kernel``'s order.
+
+    Returns ``[heads, pmax, R / pmax, head_dim]``: per head, the contraction axis split so
+    it lands on SBUF partitions, which is what ``nc_matmul`` contracts over. One head is
+    then one contiguous DMA. Runs on a parameter, so it constant-folds at trace time.
+    """
+    _, r = w.shape
+    per_head = w.reshape(heads, head_dim, r)
+    return per_head.permute(0, 2, 1).reshape(heads, r // pmax, pmax, head_dim).permute(0, 2, 1, 3).contiguous()
 
 
 def compress_sharded(compressor, x, start_pos, freqs_cos_sin, tp_shard):
@@ -166,8 +165,6 @@ def _seq_parallel_prefill(phase: str, full_config: CSAConfig) -> bool:
     if phase != "prefill":
         return False
     if os.environ.get("CSA_SEQ_PARALLEL", "") == "1":
-        # Diagnostic: sequence-parallel sharding INDEPENDENT of the sparse dispatch, so
-        # the sharding and the sparse kernel can be bisected against each other.
         return True
     return _use_sparse_prefill(full_config.compressed_len)
 
@@ -507,16 +504,9 @@ class CompressorNKI(nn.Module):
         cos_rep = compress_cos.float().repeat_interleave(2, dim=-1).contiguous()
         sin_rep = compress_sin.float().repeat_interleave(2, dim=-1).contiguous()
 
-        # SPMD across compressed-position tiles (query-row-analog for the compressor):
-        # the kernel splits its 128-position tiles across cores with no cross-core
-        # reduction. Use 2 cores when the tile count splits evenly; else single core.
         TILE_P = 128
         num_tiles = (T_c + TILE_P - 1) // TILE_P
         n_cores = 2 if (T_c % TILE_P == 0 and num_tiles % 2 == 0) else 1
-        # The indexer's compressor (rotate=True) rotates its result by an orthonormal
-        # Hadamard. Handing the matrix to the kernel keeps softmax, RMSNorm, the RoPE
-        # interleave AND that matmul off the host: one transpose plus one matmul per 128
-        # compressed positions, on a head_dim of 128.
         had = get_hadamard_matrix(hd, kv8.device, torch.bfloat16) if self.rotate else None
         out = nki_compressor_core_kernel[n_cores](
             kv8, score8, norm_weight, cos_rep, sin_rep, float(self.norm.eps), ape_slots, had
@@ -553,12 +543,6 @@ class CompressorNKI(nn.Module):
             return shard if halo == 0 else shard[:, halo:]
 
         W = torch.cat([self.wkv.weight, self.wgate.weight], dim=0).to(torch.bfloat16)
-        # The .float() is NOT redundant: on XLA it fuses into the matmul so the fp32
-        # accumulator flows out directly, where a bf16 output rounds the product first.
-        # Measured on a [1024, 7168] x [7168, 2048] bf16 linear against an fp32 reference:
-        # 4.66e-09 max_abs_diff with the cast, 3.05e-05 without. Dropping it moved the
-        # block error from 1.07e-03 to 1.14e-03 at 8192 and 1.29e-03 to 1.36e-03 at 32768
-        # while measuring latency-neutral, so the fp32 temporary earns its cost.
         kv_score = F.linear(x.to(torch.bfloat16), W).float()
         return self._compress_from_kv_score(kv_score, seqlen, freqs_cos_sin)
 
@@ -613,30 +597,6 @@ class IndexerNKI(nn.Module):
             self.register_buffer("causal_bias_full", causal_bias.float().contiguous(), persistent=False)
             # Zero bias used for start_pos != 0 (decode) — no causal masking on scores.
             self.register_buffer("zero_bias_full", torch.zeros(S_q, T_c_idx, dtype=torch.float32), persistent=False)
-
-    def _build_mask_from_scores(self, scores, k, T_c_out, device):
-        """Build selection mask from scores using binary-search threshold finding.
-        Uses bisection to find the k-th largest value per row, then generates mask.
-        Selects all elements >= threshold (may select slightly more than k in case
-        of ties, which is acceptable for attention masking)."""
-        _NEG_INF = -1e9
-        T_c_local = scores.shape[2]
-
-        scores = scores.float()
-        hi = scores.max(dim=-1, keepdim=True).values
-        lo = torch.where(scores > -1e8, scores, hi).min(dim=-1, keepdim=True).values
-
-        for _ in range(9):
-            mid = (lo + hi) * 0.5
-            count = (scores >= mid).to(scores.dtype).sum(dim=-1, keepdim=True)
-            lo = torch.where(count >= k, mid, lo)
-            hi = torch.where(count < k, mid, hi)
-
-        sel_mask = torch.where(scores >= lo, 0.0, _NEG_INF)
-
-        if T_c_local < T_c_out:
-            sel_mask = F.pad(sel_mask, (0, T_c_out - T_c_local), value=_NEG_INF)
-        return sel_mask
 
     def forward(self, x, qr, start_pos, offset, freqs_cos_sin):
         bsz, seqlen, _ = x.size()
@@ -707,11 +667,6 @@ class IndexerNKI(nn.Module):
         num_q_tiles = S_q // TILE_Q
         n_cores = 2 if (S_q % TILE_Q == 0 and num_q_tiles % 2 == 0) else 1
         if _use_sparse_prefill(kv_t_2d.shape[1]):
-            # `n_cores`, not [1]: the kernel already shards its query tiles by program_id,
-            # so a [1] launch left the second physical core completely idle for the whole
-            # launch while the first ran its engines near saturation. The guard matters: the
-            # kernel divides `num_q_tiles // n_cores`, so an odd tile count on a 2-core
-            # grid would silently drop the last tile.
             scores_2d = nki_indexer_score_kernel[n_cores](q_T_all, kv_t_2d, weights_2d, cbias)
             topk_idx = nki_prefill_topk_kernel[2](scores_2d.to(torch.bfloat16), int(k), _SAFE_TOPK_N)
             return first_mask, topk_idx.to(torch.int32).unsqueeze(0)
@@ -998,19 +953,13 @@ class CSAAttentionXLA(nn.Module):
             do_rope=0,
         ).reshape(bsz, seqlen, self.q_lora_rank)
         qr_q = qr if self._q_range is None else qr[:, q_lo:q_hi, :]
-        q = self.wq_b(qr_q)  # [B, n_q, H*D]
 
-        q_out = nki_rms_rope_kernel[2](
-            q.reshape(bsz * n_q, H * D)[0:n_q].to(torch.bfloat16),
+        q_out = nki_qb_rms_rope_kernel[2](
+            qr_q.reshape(n_q, self.q_lora_rank).to(torch.bfloat16),
+            _pack_qb_weight(self.wq_b.weight, H, D),
             cos_qs,
             sin_qs,
-            None,
             self.eps,
-            do_rms=1,
-            inverse=0,
-            heads=H,
-            in_head_major=0,
-            out_head_major=0,
         )
         q = q_out.reshape(bsz, n_q, H, D)
 
@@ -1062,19 +1011,12 @@ class CSAAttentionXLA(nn.Module):
         o = o_out.reshape(bsz, n_out, H * D)
 
         # ===== Output Projection (grouped low-rank) =====
-        # Two orderings. Fusing composes wo_a into wo_b and then needs ONE matmul;
-        # unfused projects to o_lora_rank first and then out.
-        # Stays in XLA deliberately. Per-region profiling of the 32768 block puts both of
-        # this projection's regions close to the tensor engine's achievable limit, with
-        # TensorE busy nearly the whole time and a small share of the block's wall clock.
-        # A NKI rewrite cannot reduce the FLOPs and has no idle engine to claim, so there
-        # is nothing here to win.
         G, R, Din = self.n_local_groups, self.o_lora_rank, self.group_in
         o = o.reshape(bsz, n_out, G, Din)
         rows = bsz * n_out
         fused_macs = self.dim * G * R * Din + rows * G * Din * self.dim
         unfused_macs = rows * G * Din * R + rows * G * R * self.dim
-        
+
         _FUSED_WEIGHT_BUDGET = 1 << 27  # 1.34e8 elements
         if fused_macs <= unfused_macs and self.dim * G * Din <= _FUSED_WEIGHT_BUDGET:
             wo_a = self.wo_a.weight.view(G, R, Din)
@@ -1087,10 +1029,6 @@ class CSAAttentionXLA(nn.Module):
             output = self.wo_b(lat.reshape(bsz, n_out, G * R))
 
         # ===== Cross-rank all-reduce (merged): RowParallelLinear sum over ranks =====
-        # When replica_ranks is set (multi-worker torchrun), append the 2-LNC
-        # ncc.all_reduce(op=add) as the block's FINAL op so the traced block is one
-        # integrated lnc=2 NEFF returning the full [B,S,dim]. Otherwise return the
-        # rank-local partial and let the caller host-sum the ranks.
         if self.replica_ranks is not None:
             return tp_all_reduce(output, self.replica_ranks)
         return output
@@ -1137,24 +1075,23 @@ class DecodeIndexerGatheredNKI(nn.Module):
 
         wT = self.wq_b.weight.t().contiguous().reshape(self.q_lora_rank // 128, 128, self.n_heads * self.head_dim)
         qr_2d = qr.reshape(1, self.q_lora_rank)
-        qT = nki_indexer_qproj_gemv[2](wT, qr_2d)  # [head_dim, n_heads] bf16
-        q = qT.t().contiguous().reshape(1, 1, self.n_heads, self.head_dim)
-        q_rope = apply_rotary_emb_functional(q[..., -rd:], (seq_cos, seq_sin))
-        q = torch.cat([q[..., :-rd], q_rope], dim=-1)
-        q = hadamard_transform(q)
+        # The RoPE, the Hadamard rotation and the Q^T replication now happen INSIDE the
+        # launch that was already doing this projection, so five host ops and both
+        # intermediates disappear without adding a launch. The kernel returns q_T_all
+        # directly in the scorer's [head_dim, n_heads * S_q] layout.
+        q_T_all = nki_indexer_qproj_rope_had_gemv[2](
+            wT,
+            qr_2d,
+            seq_cos.float().contiguous(),
+            seq_sin.float().contiguous(),
+            get_hadamard_matrix(self.head_dim, qr.device, torch.bfloat16),
+            int(S_q),
+        )
 
         indexer_kv_t = indexer_kv_cache.transpose(1, 2)  # [1, head_dim, T_c]
 
         weights = F.linear(x, (self.weights_proj.weight * self.weight_scale).to(torch.bfloat16))
 
-        q_single = q[0, 0]
-        q_T_all = (
-            q_single.permute(1, 0)
-            .unsqueeze(2)
-            .expand(self.head_dim, self.n_heads, S_q)
-            .reshape(self.head_dim, self.n_heads * S_q)
-            .contiguous()
-        )
         weights_2d = weights[0, 0:1].float().expand(S_q, -1).contiguous()
 
         return q_T_all, weights_2d, indexer_kv_t, T_c, k, S_q
@@ -1172,12 +1109,6 @@ class DecodeIndexerGatheredNKI(nn.Module):
         path AND the top-k width divides the attention gather's chunk. Returns None
         otherwise, in which case the caller falls back to the unchanged
         `forward()` -> `nki_decode_gather_ok_kernel[1]` two-launch pipeline.
-
-        The gate clauses are exactly `forward`'s, so no seq-len that used to take
-        the merged scoring path can silently drop to a slower one; the only added
-        clause is `k % gather_chunk == 0`, which the attention kernel's
-        num_k_chunks = k // COMP_CHUNK tiling already required of every config it
-        ran on (k=1024, COMP_CHUNK=128).
         """
         T_c = indexer_kv_cache.shape[1]
         k = min(self.index_topk, T_c)
@@ -1196,19 +1127,7 @@ class DecodeIndexerGatheredNKI(nn.Module):
         return q_T_all, kv_t_seg, weights_2d, k, self.SAFE_TOPK_N
 
     def forward(self, x, qr, start_pos, indexer_kv_cache, freqs_cos_sin):
-        """Score all T_c in chunks → bisection per chunk → merge top-k indices.
-
-        For large T_c (e.g. 16384), the full score array doesn't fit in SBUF.
-        Strategy: split indexer_kv_cache into segments of IDX_CHUNK, score each
-        with nki_indexer_score_kernel (which writes scores to HBM), concatenate,
-        then use nkilib topk or bisection on the concatenated scores.
-
-        Still the entry point for the MULTI-chunk path (and for any single-chunk
-        config the fused kernel's gate rejects); the single-chunk decode path now
-        goes through `fused_single_chunk_inputs` +
-        `nki_indexer_score_topk_gather_2core[2]`, which folds this scoring, its
-        top-k, AND the attention body into one launch.
-        """
+        """Score all T_c in chunks → bisection per chunk → merge top-k indices."""
         q_T_all, weights_2d, indexer_kv_t, T_c, k, S_q = self._score_inputs(
             x, qr, start_pos, indexer_kv_cache, freqs_cos_sin
         )
@@ -1283,9 +1202,6 @@ class DecodeIndexerGatheredNKI(nn.Module):
             kv_t_seg = indexer_kv_t[0, :, seg_start:seg_end].contiguous()  # [head_dim, seg_len]
             zero_bias_seg = torch.zeros_like(kv_t_seg[0:1]).float().expand(S_q, -1).contiguous()
 
-            # S_q = TILE_Q = 128 → exactly one query tile, so launch on 1 core
-            # (the kernel does num_q_tiles // n_cores tiles per core; with 2 cores
-            # that would be 1 // 2 = 0 and produce no scores).
             scores_seg = nki_indexer_score_kernel[1](q_T_all, kv_t_seg, weights_2d, zero_bias_seg)
             score_chunks.append(scores_seg)  # [S_q, seg_len]
 
@@ -1335,9 +1251,6 @@ class DecodeIndexerGatheredNKI(nn.Module):
             # merge_local_idx[s, i] indexes into merged_indices[s, :] → use torch.gather
             topk_head = torch.gather(merged_indices, dim=1, index=merge_local_idx.long()).int()
 
-        # Return a single index row [1, k]: the attention kernel batches heads on
-        # partitions and reads only column 0 of topk_indices_T (its 2-core split is
-        # by-HEAD, S-independent), so the S=256 broadcast was pure dead weight.
         return topk_head[0:1].contiguous()
 
 
@@ -1385,12 +1298,6 @@ class CSADecodeAttentionGatheredNKI(nn.Module):
         full_freqs_cs = (self.freqs_cos, self.freqs_sin)
 
         # ---- FUSED indexer-score + top-k + attention (single launch) ----------
-        # `fused_single_chunk_inputs` returns the indexer's scoring inputs when this
-        # step qualifies for the fused [2]-grid kernel (both graded seq-lens do), or
-        # None to fall back to the unchanged two-launch pipeline. Asking for it here,
-        # BEFORE the attention-side host prep, keeps the indexer's own op sequence in
-        # the same relative position in the traced graph as the `self.indexer(...)`
-        # call it replaces.
         COMP_CHUNK = 128  # the attention kernel's gather chunk (k must divide it)
         fused_inputs = self.indexer.fused_single_chunk_inputs(
             x, qr, start_pos, indexer_kv_cache, full_freqs_cs, COMP_CHUNK
@@ -1562,18 +1469,6 @@ class CSADecodeAttentionBlockNKI(nn.Module):
                                             + dim*n_local_groups*o_lora  bytes
           fused (compose wo_b@wo_a):  reads  dim*n_local_groups*group_in  bytes
 
-        The fused single-matmul weight is [dim, n_local_groups*group_in]; composing
-        wo_a into wo_b EXPANDS the projected width from o_lora_rank back up to
-        group_in, so fusing only wins when group_in <= o_lora_rank (the reduced
-        test model: group_in=1024=o_lora_rank). The PRODUCTION shard
-        (original_model.py world_size=4) has group_in = n_heads*head_dim/n_groups =
-        128*512/16 = 4096 > o_lora_rank=1024, where fusing would stream
-        dim*4*4096 = 234MB vs the two-step's 92MB — a 2.55x HBM blow-up that stalls
-        the PE. So keep the low-rank o_lora bottleneck: apply wo_a (compress
-        group_in->o_lora per group) THEN wo_b, exactly as original_model.py's
-        einsum + RowParallelLinear. We pick whichever reads fewer weight bytes so
-        the reduced-model fusion win is preserved and the full model takes the
-        cheap two-step path.
         """
         o = o.reshape(bsz, seqlen, self.n_groups, self.group_in)
         g0 = self.tp_rank * self.n_local_groups
@@ -1772,18 +1667,7 @@ def _trace_rank(phase, full_config, tp_size, tp_rank, ref, inputs, workdir, repl
 
 
 def warm_up(traced, inputs) -> None:
-    """Execute ``traced`` once and discard the result, before any graded execution.
-
-    The graded runs execute each NEFF exactly once, so without this they would grade a
-    NEFF's FIRST execution -- and the indexer top-k has a first-execution hazard that
-    only shows up there. The one instance that has been root-caused is a uint32
-    bitvec chain over ``nisa.topk``'s index output disagreeing with the same arithmetic
-    on the host on run 0 and agreeing on every run after (see the snake-layout note in
-    ``csa_decode_attention``); because run 1+ reads back the value the previous run
-    left in that SBUF, a warm-up hides it rather than fixing it. The shipped fill does
-    no such arithmetic and measures 1024/1024 winners on run 0, so this is now
-    defensive rather than load-bearing.
-    """
+    """Execute ``traced`` once and discard the result, before any graded execution."""
     traced(*inputs)
 
 

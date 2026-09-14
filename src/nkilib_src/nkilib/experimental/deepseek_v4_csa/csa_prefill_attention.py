@@ -69,12 +69,6 @@ from ...core.utils.kernel_assert import kernel_assert
 # processing [TILE_S, head_dim] blocks with cos/sin sliced per tile (decode
 # broadcasts one position with a stride-0 .ap()).
 #
-# Replaces this XLA chain, which materialized ~6 full [B,S,H,D] temporaries:
-#   q * rsqrt(q.square().mean(-1) + eps)          (per-head RMS, no gain)
-#   cat([x[..., :-rd], rope(x[..., -rd:])], -1)    (RoPE on the trailing rd dims)
-# `gain_in=None` gives the no-learnable-gain q variant; passing kv_norm.weight
-# gives the learnable-gain kv/RMSNorm variant. `inverse=1` negates sin for the
-# output de-RoPE, and `do_rms=0` skips the norm (de-RoPE is rotation only).
 # --------------------------------------------------------------------------
 @nki.jit
 def nki_rms_rope_kernel(
@@ -134,12 +128,6 @@ def nki_rms_rope_kernel(
         gain = nl.ndarray((TILE, head_dim), dtype=nl.float32, buffer=nl.sbuf)
         nisa.dma_copy(dst=gain[0:TILE, 0:head_dim], src=gain_in.ap(pattern=[[0, TILE], [1, head_dim]]), priority=1)
 
-    # SPMD across the (head, position-tile) space, which has no cross-tile dependency:
-    # every tile reads its own rows and writes its own rows. Left grid-less this kernel ran
-    # on ONE core, leaving the second core idle across this kernel's four launches while the
-    # first carried the work on its Vector engine. Heads split first when they divide the grid
-    # (the q and de-RoPE paths, 32 or 128 heads); otherwise the position tiles do (the kv
-    # path, heads=1). A 1-core grid takes the same path with n_cores=1 and is unchanged.
     core_id = nl.program_id(0)
     n_cores = nl.num_programs()
     if heads % n_cores == 0:
@@ -313,6 +301,145 @@ def nki_rms_rope_kernel(
 
 
 # --------------------------------------------------------------------------
+# NKI Kernel: q projection + per-head RMS + RoPE, in ONE existing launch
+# --------------------------------------------------------------------------
+@nki.jit
+def nki_qb_rms_rope_kernel(
+    latent_in: nl.NkiTensor,  # [S, R] — the normalized q latent (bf16)
+    w_packed: nl.NkiTensor,  # [heads, 128, R/128, head_dim] — wq_b packed per head (bf16)
+    cos_in: nl.NkiTensor,  # [S, half_rope] — per-position cos (fp32)
+    sin_in: nl.NkiTensor,  # [S, half_rope] — per-position sin (fp32)
+    eps: float,
+    heads_per_pass: int = 8,
+) -> nl.NkiTensor:
+    """``wq_b`` then per-head RMSNorm then RoPE, emitted query-major.
+
+    This replaces a host ``self.wq_b(qr)`` whose output was already being handed straight
+    to ``nki_rms_rope_kernel``. Folding the projection into that consumer is the point: the
+    q path already issues two NKI launches with an XLA GEMM wedged between them, so doing
+    the GEMM here removes the XLA op and adds NO launch.
+
+    """
+    S, R = latent_in.shape
+    heads, pmax_w, n_r_tiles, head_dim = w_packed.shape
+    half_rope = cos_in.shape[1]
+    rope_head_dim = 2 * half_rope
+    nope_dim = head_dim - rope_head_dim
+    TILE = 128
+    kernel_assert(pmax_w == TILE, f"w_packed partition dim {pmax_w} must be {TILE}")
+    kernel_assert(R == n_r_tiles * TILE, f"latent R={R} vs w_packed R={n_r_tiles * TILE}")
+    kernel_assert(S % TILE == 0, f"S={S} must be a multiple of {TILE}")
+    kernel_assert(heads % heads_per_pass == 0, f"heads={heads} must be a multiple of {heads_per_pass}")
+    n_tiles = S // TILE
+    n_passes = heads // heads_per_pass
+
+    out = nl.ndarray((S, heads * head_dim), dtype=nl.bfloat16, buffer=nl.shared_hbm)
+
+    # SPMD over position tiles: each core owns disjoint output rows, no reduction.
+    core_id = nl.program_id(0)
+    n_cores = nl.num_programs()
+    tiles_per_core = (n_tiles + n_cores - 1) // n_cores
+
+    for hp in nl.affine_range(n_passes):
+        # Weights for this pass's heads, one contiguous DMA each, reused by every tile.
+        w_sb = [None] * heads_per_pass
+        for hl in nl.affine_range(heads_per_pass):
+            h = hp * heads_per_pass + hl
+            w_sb[hl] = nl.ndarray((TILE, n_r_tiles, head_dim), dtype=nl.bfloat16, buffer=nl.sbuf)
+            nisa.dma_copy(dst=w_sb[hl], src=w_packed[h], priority=1)
+
+        for tl in nl.affine_range(tiles_per_core):
+            ts = core_id * tiles_per_core + tl
+            if ts >= n_tiles:
+                continue
+            s0 = ts * TILE
+
+            # Latent tile once per (pass, tile), transposed to put R on partitions.
+            lat_sb = nl.ndarray((TILE, R), dtype=nl.bfloat16, buffer=nl.sbuf)
+            nisa.dma_copy(dst=lat_sb, src=latent_in[s0 : s0 + TILE, 0:R], priority=0)
+            lat_t = [None] * n_r_tiles
+            for rt in nl.affine_range(n_r_tiles):
+                tp = nl.ndarray((TILE, TILE), dtype=nl.bfloat16, buffer=nl.psum)
+                nisa.nc_transpose(dst=tp, data=lat_sb[0:TILE, rt * TILE : (rt + 1) * TILE])
+                lat_t[rt] = nl.ndarray((TILE, TILE), dtype=nl.bfloat16, buffer=nl.sbuf)
+                nisa.tensor_copy(dst=lat_t[rt], src=tp)
+
+            # cos/sin for these positions, shared by every head.
+            cos_h = nl.ndarray((TILE, half_rope), dtype=nl.float32, buffer=nl.sbuf)
+            nisa.dma_copy(dst=cos_h, src=cos_in[s0 : s0 + TILE, 0:half_rope], priority=2)
+            sin_h = nl.ndarray((TILE, half_rope), dtype=nl.float32, buffer=nl.sbuf)
+            nisa.dma_copy(dst=sin_h, src=sin_in[s0 : s0 + TILE, 0:half_rope], priority=2)
+
+            for hl in nl.affine_range(heads_per_pass):
+                h = hp * heads_per_pass + hl
+
+                # ---- projection: [TILE, head_dim] accumulated over R in fp32 PSUM ----
+                acc = nl.ndarray((TILE, head_dim), dtype=nl.float32, buffer=nl.psum)
+                for rt in nl.affine_range(n_r_tiles):
+                    nisa.nc_matmul(
+                        dst=acc,
+                        stationary=lat_t[rt],
+                        moving=w_sb[hl][0:TILE, rt, 0:head_dim],
+                        accumulate=(rt > 0),
+                    )
+                # Round to bf16 exactly where the bf16 nn.Linear did, then widen for the
+                # fp32 norm -- keeps this bit-comparable rather than more precise.
+                proj_bf = nl.ndarray((TILE, head_dim), dtype=nl.bfloat16, buffer=nl.sbuf)
+                nisa.tensor_copy(dst=proj_bf, src=acc)
+                x = nl.ndarray((TILE, head_dim), dtype=nl.float32, buffer=nl.sbuf)
+                nisa.tensor_copy(dst=x, src=proj_bf)
+
+                # ---- per-head RMSNorm over head_dim, no learnable gain ----
+                sq = nl.ndarray((TILE, head_dim), dtype=nl.float32, buffer=nl.sbuf)
+                nisa.tensor_tensor(dst=sq, data1=x, data2=x, op=nl.multiply)
+                msq = nl.ndarray((TILE, 1), dtype=nl.float32, buffer=nl.sbuf)
+                nisa.tensor_reduce(dst=msq, data=sq, op=nl.add, axis=1)
+                nisa.tensor_scalar(
+                    dst=msq, data=msq, op0=nl.multiply, operand0=1.0 / head_dim, op1=nl.add, operand1=eps
+                )
+                rms = nl.ndarray((TILE, 1), dtype=nl.float32, buffer=nl.sbuf)
+                nisa.activation(dst=rms, op=nl.rsqrt, data=msq)
+                normed = nl.ndarray((TILE, head_dim), dtype=nl.float32, buffer=nl.sbuf)
+                nisa.tensor_scalar(dst=normed, data=x, op0=nl.multiply, operand0=rms)
+                normed_bf = nl.ndarray((TILE, head_dim), dtype=nl.bfloat16, buffer=nl.sbuf)
+                nisa.tensor_copy(dst=normed_bf, src=normed)
+
+                # ---- RoPE on the trailing rope_head_dim channels, fp32 math ----
+                row = nl.ndarray((TILE, head_dim), dtype=nl.bfloat16, buffer=nl.sbuf)
+                if nope_dim > 0:
+                    nisa.tensor_copy(dst=row[0:TILE, 0:nope_dim], src=normed_bf[0:TILE, 0:nope_dim])
+                rope_f = nl.ndarray((TILE, rope_head_dim), dtype=nl.float32, buffer=nl.sbuf)
+                nisa.tensor_copy(dst=rope_f, src=normed_bf[0:TILE, nope_dim:head_dim])
+                pairs = rope_f.reshape((TILE, half_rope, 2))
+                x1 = nl.ndarray((TILE, half_rope), dtype=nl.float32, buffer=nl.sbuf)
+                nisa.tensor_copy(dst=x1, src=pairs[0:TILE, 0:half_rope, 0])
+                x2 = nl.ndarray((TILE, half_rope), dtype=nl.float32, buffer=nl.sbuf)
+                nisa.tensor_copy(dst=x2, src=pairs[0:TILE, 0:half_rope, 1])
+
+                ta = nl.ndarray((TILE, half_rope), dtype=nl.float32, buffer=nl.sbuf)
+                tb = nl.ndarray((TILE, half_rope), dtype=nl.float32, buffer=nl.sbuf)
+                y1 = nl.ndarray((TILE, half_rope), dtype=nl.float32, buffer=nl.sbuf)
+                y2 = nl.ndarray((TILE, half_rope), dtype=nl.float32, buffer=nl.sbuf)
+                nisa.tensor_tensor(dst=ta, data1=x1, data2=cos_h, op=nl.multiply)
+                nisa.tensor_tensor(dst=tb, data1=x2, data2=sin_h, op=nl.multiply)
+                nisa.tensor_tensor(dst=y1, data1=ta, data2=tb, op=nl.subtract)
+                nisa.tensor_tensor(dst=ta, data1=x1, data2=sin_h, op=nl.multiply)
+                nisa.tensor_tensor(dst=tb, data1=x2, data2=cos_h, op=nl.multiply)
+                nisa.tensor_tensor(dst=y2, data1=ta, data2=tb, op=nl.add)
+
+                rope_out = nl.ndarray((TILE, half_rope, 2), dtype=nl.float32, buffer=nl.sbuf)
+                nisa.tensor_copy(dst=rope_out[0:TILE, 0:half_rope, 0], src=y1)
+                nisa.tensor_copy(dst=rope_out[0:TILE, 0:half_rope, 1], src=y2)
+                nisa.tensor_copy(
+                    dst=row[0:TILE, nope_dim:head_dim], src=rope_out.reshape((TILE, rope_head_dim))
+                )
+
+                nisa.dma_copy(dst=out[s0 : s0 + TILE, h * head_dim : (h + 1) * head_dim], src=row)
+
+    return out
+
+
+# --------------------------------------------------------------------------
 # NKI Kernel: Compressor gated-pooling + RMSNorm + RoPE core
 # --------------------------------------------------------------------------
 @nki.jit
@@ -377,12 +504,6 @@ def nki_compressor_core_kernel(
         gain = nl.ndarray((p_sz, head_dim), dtype=nl.float32, buffer=nl.sbuf)
         nisa.dma_copy(dst=gain, src=norm_weight.ap(pattern=[[0, p_sz], [1, head_dim]]))
 
-        # --- Load all slots for this position tile ---
-        # The operands arrive BF16 and are widened here rather than on the host. They come
-        # from a bf16 F.linear, so bf16 -> fp32 is exact and this is bit-identical to
-        # taking them pre-widened -- but it halves what crosses HBM and, more to the point,
-        # stops the host from materializing the fp32 copies at all (537 MB for the
-        # projection plus 2 x 134 MB for the overlapped slots, at seq_len 32768).
         kv_slots = [None] * ratio2
         score_slots = [None] * ratio2
         for j in nl.affine_range(ratio2):
@@ -523,13 +644,6 @@ def nki_compressor_core_kernel(
         if hadamard is None:
             nisa.dma_copy(dst=out[p_start : p_start + p_sz, nope_dim:head_dim], src=rope_out_bf16)
         else:
-            # --- Rotate the assembled row: out[s, d] = sum_c row[s, c] * H[c, d] ---
-            # nc_matmul contracts over the PARTITION axis, so the row tile is transposed
-            # once to put c there; then row^T as the STATIONARY operand with H moving
-            # lands [s, d] directly, with no second transpose to undo. The bf16 operands
-            # accumulate into an fp32 PSUM and round once on the way out, which is what
-            # `bf16 @ bf16` does on XLA -- so this matches the reference bit-for-bit in
-            # intent, not just approximately.
             nisa.tensor_copy(dst=full_bf16[0:p_sz, nope_dim:head_dim], src=rope_out_bf16)
             row_t_psum = nl.ndarray((head_dim, p_sz), dtype=nl.bfloat16, buffer=nl.psum)
             nisa.nc_transpose(dst=row_t_psum, data=full_bf16[0:p_sz, 0:head_dim])
@@ -560,8 +674,7 @@ def nki_indexer_score_mask_kernel(
     Computes, per query row s and compressed kv position t:
         index_score[s, t] = sum_h relu(q[s, h, :] . kv[t, :]) * weights[s, h]
                             + causal_bias[s, t]
-    then finds, per row, a threshold via 10 iterations of bisection (matching the
-    reference _build_mask_from_scores), and builds:
+    then finds, per row, a threshold via 10 iterations of bisection, and builds:
         sel_mask[s, t] = 0     if index_score[s, t] >= threshold[s]
                          -1e9   otherwise
 
@@ -631,7 +744,7 @@ def nki_indexer_score_mask_kernel(
         nisa.dma_copy(dst=cbias, src=causal_bias[q_start : q_start + TILE_Q, 0:T_c])
         nisa.tensor_tensor(dst=index_score, data1=index_score, data2=cbias, op=nl.add)
 
-        # Binary search for per-row threshold (matches reference _build_mask_from_scores)
+        # Binary search for the per-row threshold.
         hi = nl.ndarray((TILE_Q, 1), dtype=nl.float32, buffer=nl.sbuf)
         nisa.tensor_reduce(dst=hi, op=nl.maximum, data=index_score, axis=1)
         is_valid = nl.ndarray((TILE_Q, T_c), dtype=nl.float32, buffer=nl.sbuf)
@@ -921,21 +1034,7 @@ def nki_gather_csa_attn_kernel(
     split_pos: int,  # global position offset of this second half
     ratio: int,  # compression ratio
 ) -> nl.NkiTensor:
-    """Sparse attention with static causal-bound + global-max softmax + mask predication.
-
-    Mirrors the dense kernel's math (global-max softmax over window + compressed,
-    sel_bias added as additive -1e9 predication before exp, then V-multiply and
-    normalize) but caps the compressed-chunk loop at a *compile-time* per-tile
-    causal bound. This removes the sequential dynamic_range device loop, the
-    online-softmax rescaling, and all indirect DMA — every loop is unrolled and
-    pipelinable by the compiler.
-
-    q_idx is a compile-time Python int (static_range), so causal_chunks[q_idx] is
-    known at trace time. topk_sel_bias already encodes causal masking, so processing
-    columns [0, causal_chunks*COMP_V_CHUNK) with sel_bias predication is exact:
-    every selected position lies within the causal frontier, and unselected /
-    beyond-causal positions are -1e9 -> exp -> 0 -> contribute nothing.
-    """
+    """Sparse attention with static causal-bound + global-max softmax + mask predication."""
     S = topk_sel_bias.shape[0]
     head_dim = all_q_T.shape[0]
     T_c = compress_kv_T.shape[1]
@@ -1024,12 +1123,6 @@ def nki_gather_csa_attn_kernel(
                         dst=q_T[h_local][hd], src=all_q_T[hd_start : hd_start + hd_sz, q_global : q_global + TILE_Q]
                     )
 
-            # Staged per-head processing (mirrors the dense kernel) so the compiler
-            # can pipeline the Tensor-Engine score/V matmuls of one head against the
-            # Vector-Engine exp/reduce of another. Only small per-head exp buffers and
-            # scalar sums are retained as lists; the big [128, comp_cols] fp32
-            # comp_scores buffer is transient (consumed to produce comp_exp), so SBUF
-            # stays bounded even at H_BATCH=16 (comp_exp bf16 list = 16 * comp_cols * 2B).
             win_exp_all = [None] * H_BATCH
             comp_exp_all = [None] * H_BATCH
             total_sum_all = [None] * H_BATCH
@@ -1153,17 +1246,6 @@ def nki_gather_csa_attn_kernel(
 # This kernel instead gathers each query's `k` SELECTED compressed rows with an
 # indirect DMA and scores only those, so its compressed cost is O(k) and
 # independent of context length.
-#
-# WHY IT NEEDS n_heads ON THE PARTITION DIM. The dense kernels put QUERIES on the
-# matmul output-partition dim and loop heads, which lets 128 queries share one
-# moving K^T operand -- and that sharing is exactly what per-query selection
-# breaks, because each query wants different columns. So this kernel transposes the
-# roles: heads on the output partitions, one query at a time, the gathered K^T as
-# the moving operand. That makes the stationary tile [head_dim_chunk, n_heads], so
-# it is only efficient when n_heads is large: at n_heads=128 it fills all 128
-# output partitions, at n_heads=32 it wastes three quarters of them. Hence this
-# kernel is for the SEQUENCE-PARALLEL sharding (all heads local, queries split
-# across ranks, compressed KV replicated), not the head-parallel sharding.
 #
 # The window is a per-query causal SLICE rather than a masked 256-column block, so
 # no additive window bias is needed: query p reads window columns [p, p+W) and the

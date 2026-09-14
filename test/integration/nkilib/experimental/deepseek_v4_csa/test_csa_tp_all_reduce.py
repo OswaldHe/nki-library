@@ -48,7 +48,7 @@ from test.utils.unit_test_collective_framework import CollectiveUnitTestFramewor
 pytestmark = pytest.mark.platforms(exclude=list(set(Platforms) - {Platforms.TRN3, Platforms.TRN3_A0}))
 
 # The block reshapes its [B, S, dim] partial to a balanced [P, F] tile before
-# reducing. P = 128 with dim = 7168 gives F = 56, which is the production shape.
+# reducing. P = 128 with dim = 7168 gives F = 56, the shape the block emits.
 _PARTITIONS = 128
 _FREE = 56
 

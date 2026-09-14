@@ -207,6 +207,136 @@ def nki_qkv_rms_rope_kernel(
 
 
 # --------------------------------------------------------------------------
+# NKI Kernel: decode indexer q projection + RoPE + Hadamard + Q^T broadcast
+# --------------------------------------------------------------------------
+@nki.jit
+def nki_indexer_qproj_rope_had_gemv(
+    wT: nl.NkiTensor,  # [n_ktiles, 128, N] bf16 — wq_b with wT[t, kk, n] == w[n, t*128+kk]
+    qr_in: nl.NkiTensor,  # [1, K] bf16 — the decode q-latent, K = n_ktiles * 128
+    cos_in: nl.NkiTensor,  # [1, half_rope] fp32 — this position's cos (NOT pre-repeated)
+    sin_in: nl.NkiTensor,  # [1, half_rope] fp32
+    hadamard: nl.NkiTensor,  # [head_dim, head_dim] bf16 — normalized Hadamard
+    s_q: int,  # query-tile width the scorer expects (the decode row is replicated s_q times)
+) -> nl.NkiTensor:
+    """The whole decode indexer q path, in the launch that already did its projection.
+
+    Extends ``nki_indexer_qproj_gemv`` (which this leaves untouched, since it has a torch
+    oracle and unit tests) to also do the RoPE, the Hadamard rotation and the Q^T
+    replication. That removes FIVE host ops -- the ``.t().contiguous().reshape``,
+    ``apply_rotary_emb_functional``, the ``cat`` rejoining the roped tail,
+    ``hadamard_transform``, and the ``permute/unsqueeze/expand/reshape/contiguous`` -- plus
+    the two intermediates they fed, without adding a launch.
+
+    Returns [head_dim, n_heads * s_q] bf16, the ``q_T_all`` the scorer consumes, where every
+    one of a head's s_q columns is the same decode row (that replication is what the host
+    ``expand`` was doing).
+
+    """
+    core_id = nl.program_id(0)
+    n_cores = nl.num_programs()
+
+    n_ktiles = wT.shape[0]
+    K_TILE = wT.shape[1]
+    N = wT.shape[2]
+    head_dim = hadamard.shape[0]
+    half_rope = cos_in.shape[1]
+    rope_head_dim = 2 * half_rope
+    nope_dim = head_dim - rope_head_dim
+    N_TILE = 128
+
+    kernel_assert(K_TILE == 128, "k-tile must be the 128-row nc_matmul contraction dim")
+    kernel_assert(head_dim == N_TILE, f"head_dim={head_dim} must be {N_TILE} (one n-tile per head)")
+    kernel_assert(N % N_TILE == 0, "N must tile evenly by 128 (one head's channels per tile)")
+    n_ntiles = N // N_TILE  # == n_heads, since head_dim == N_TILE
+    kernel_assert(n_ntiles % n_cores == 0, "n-tiles must split evenly across the grid")
+
+    nt_core = n_ntiles // n_cores
+    j0 = core_id * nt_core
+    c0 = j0 * N_TILE
+    N_core = nt_core * N_TILE
+
+    out = nl.ndarray((head_dim, n_ntiles * s_q), dtype=nl.bfloat16, buffer=nl.shared_hbm, name="qproj_qT_all")
+
+    qr_sb = nl.ndarray((K_TILE, n_ktiles), dtype=nl.bfloat16, buffer=nl.sbuf)
+    nisa.dma_copy(dst=qr_sb, src=qr_in.ap(pattern=[[1, K_TILE], [K_TILE, n_ktiles]], offset=0), priority=1)
+
+    h_sb = nl.ndarray((head_dim, head_dim), dtype=nl.bfloat16, buffer=nl.sbuf)
+    nisa.dma_copy(dst=h_sb, src=hadamard[0:head_dim, 0:head_dim], priority=1)
+
+    # ---- projection: unchanged from nki_indexer_qproj_gemv ----
+    acc = nl.ndarray((K_TILE, nt_core), dtype=nl.float32, buffer=nl.psum)
+    w_sb = nl.ndarray((K_TILE, N_core), dtype=nl.bfloat16, buffer=nl.sbuf)
+    for t in nl.sequential_range(n_ktiles):
+        nisa.dma_copy(dst=w_sb, src=wT[t, 0:K_TILE, c0 : c0 + N_core], priority=0)
+        for j in nl.affine_range(nt_core):
+            nisa.nc_matmul(
+                dst=acc[0:K_TILE, j : j + 1],
+                stationary=w_sb[0:K_TILE, j * N_TILE : (j + 1) * N_TILE],
+                moving=qr_sb[0:K_TILE, t : t + 1],
+                accumulate=(t > 0),
+            )
+    # Single fp32 -> bf16 rounding, where the bf16 nn.Linear rounded.
+    qc = nl.ndarray((K_TILE, nt_core), dtype=nl.bfloat16, buffer=nl.sbuf)
+    nisa.tensor_copy(dst=qc, src=acc)
+
+    # ---- channel-major -> head-major so RoPE sees channels on the free axis ----
+    hm_ps = nl.ndarray((nt_core, head_dim), dtype=nl.bfloat16, buffer=nl.psum)
+    nisa.nc_transpose(dst=hm_ps, data=qc)
+    hm = nl.ndarray((nt_core, head_dim), dtype=nl.bfloat16, buffer=nl.sbuf)
+    nisa.tensor_copy(dst=hm, src=hm_ps)
+
+    # ---- RoPE on the trailing rope_head_dim channels, fp32 math ----
+    rope_f = nl.ndarray((nt_core, rope_head_dim), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.tensor_copy(dst=rope_f, src=hm[0:nt_core, nope_dim:head_dim])
+    pairs = rope_f.reshape((nt_core, half_rope, 2))
+    x1 = nl.ndarray((nt_core, half_rope), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.tensor_copy(dst=x1, src=pairs[0:nt_core, 0:half_rope, 0])
+    x2 = nl.ndarray((nt_core, half_rope), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.tensor_copy(dst=x2, src=pairs[0:nt_core, 0:half_rope, 1])
+
+    cos_h = nl.ndarray((nt_core, half_rope), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.dma_copy(dst=cos_h, src=cos_in.ap(pattern=[[0, nt_core], [1, half_rope]]), priority=2)
+    sin_h = nl.ndarray((nt_core, half_rope), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.dma_copy(dst=sin_h, src=sin_in.ap(pattern=[[0, nt_core], [1, half_rope]]), priority=2)
+
+    ta = nl.ndarray((nt_core, half_rope), dtype=nl.float32, buffer=nl.sbuf)
+    tb = nl.ndarray((nt_core, half_rope), dtype=nl.float32, buffer=nl.sbuf)
+    y = nl.ndarray((nt_core, half_rope, 2), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.tensor_tensor(dst=ta, data1=x1, data2=cos_h, op=nl.multiply)
+    nisa.tensor_tensor(dst=tb, data1=x2, data2=sin_h, op=nl.multiply)
+    nisa.tensor_tensor(dst=y[0:nt_core, 0:half_rope, 0], data1=ta, data2=tb, op=nl.subtract)
+    nisa.tensor_tensor(dst=ta, data1=x1, data2=sin_h, op=nl.multiply)
+    nisa.tensor_tensor(dst=tb, data1=x2, data2=cos_h, op=nl.multiply)
+    nisa.tensor_tensor(dst=y[0:nt_core, 0:half_rope, 1], data1=ta, data2=tb, op=nl.add)
+    # Rejoin in place: this is the `cat` the host was doing.
+    nisa.tensor_copy(dst=hm[0:nt_core, nope_dim:head_dim], src=y.reshape((nt_core, rope_head_dim)))
+
+    # ---- Hadamard, which also restores the scorer's channel-major layout ----
+    rt_ps = nl.ndarray((head_dim, nt_core), dtype=nl.bfloat16, buffer=nl.psum)
+    nisa.nc_transpose(dst=rt_ps, data=hm)
+    rt = nl.ndarray((head_dim, nt_core), dtype=nl.bfloat16, buffer=nl.sbuf)
+    nisa.tensor_copy(dst=rt, src=rt_ps)
+    had = nl.ndarray((head_dim, nt_core), dtype=nl.float32, buffer=nl.psum)
+    nisa.nc_matmul(dst=had, stationary=h_sb, moving=rt)
+    qT = nl.ndarray((head_dim, nt_core), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.tensor_copy(dst=qT, src=had)
+
+    # ---- replicate each head's column s_q times, then ONE DMA for the whole range ----
+    ones = nl.ndarray((head_dim, s_q), dtype=nl.bfloat16, buffer=nl.sbuf)
+    nisa.memset(dst=ones, value=1.0)
+    out_sb = nl.ndarray((head_dim, nt_core * s_q), dtype=nl.bfloat16, buffer=nl.sbuf)
+    for j in nl.affine_range(nt_core):
+        nisa.tensor_scalar(
+            dst=out_sb[0:head_dim, j * s_q : (j + 1) * s_q],
+            data=ones,
+            op0=nl.multiply,
+            operand0=qT[0:head_dim, j : j + 1],
+        )
+    nisa.dma_copy(dst=out[0:head_dim, j0 * s_q : (j0 + nt_core) * s_q], src=out_sb, priority=1)
+
+    return out
+
+# --------------------------------------------------------------------------
 # nisa.topk batched kernel + encode/decode helpers
 # --------------------------------------------------------------------------
 NISA_TOPK_GROUP_SIZE = 16
@@ -492,17 +622,7 @@ def _score_2core_stage(
     weights: nl.NkiTensor,  # [S_q, n_heads] — per-row per-head weights * weight_scale (fp32)
     scores_dst: nl.NkiTensor,  # [1, W] bf16 shared_hbm (W >= T_c) — destination score row
 ) -> None:
-    """Score this LNC core's disjoint T_c slice into scores_dst[0:1, t_base:...].
-
-    A plain Python helper (NOT a @nki.jit kernel) so the SAME traced instruction
-    sequence is shared verbatim by both the standalone scorer
-    (`nki_indexer_score_2core`, multi-chunk path) and the merged score+topk kernel
-    (`nki_indexer_score_topk_2core`, single-chunk decode path) -> the two are
-    bit-identical by construction. `scores_dst` may be WIDER than T_c (the merged
-    kernel passes the n=8192 top-k-padded row); only columns
-    [t_base, t_base + Tc_per_core) are touched, at element stride 1 exactly as
-    before, so the written bytes do not depend on the buffer width.
-    """
+    """Score this LNC core's disjoint T_c slice into scores_dst[0:1, t_base:...]."""
     head_dim = q_T_all.shape[0]
     total_q_free = q_T_all.shape[1]
     T_c = kv_t.shape[1]
@@ -630,9 +750,6 @@ def _snake_topk_stage(
     SNAKE_X = n_val // GROUP
     PAR = 128
 
-    # PAR stays 128: nisa.topk needs all 128 partitions resident (a 16-partition alloc
-    # faults at runtime) even though only group 0 is filled and read. Groups 1..7 are
-    # left uninitialized -- their contents cannot reach the output.
     snake_src = nl.ndarray((PAR, SNAKE_X), dtype=nl.bfloat16, buffer=nl.sbuf)
     _snake_fill(scores, snake_src, 0, SNAKE_X, priority=0)
 
@@ -805,17 +922,7 @@ def _gather_attn_stage(
     h_base: int,  # global head offset of this call's head batch
     H_BATCH: int,  # heads processed by this call
 ) -> None:
-    """O(k) decode attention: gather K and V in chunks, score+accumulate via matmul.
-
-    Uses only indirect_dim=0 (row gather) from compress_kv for both K and V.
-    K is gathered then transposed in SBUF for the Q@K^T scoring matmul.
-
-    The caller's idx_chunks give COMP_CHUNK distinct indices per chunk for the
-    swdge gather (partition-dim slicing of a k-long contiguous uint32 row).
-
-    Total compressed KV operations: (k / COMP_CHUNK) DMA gathers + matmuls.
-    For k=1024: 8 gathers + 8 matmuls, regardless of T_c.
-    """
+    """O(k) decode attention: gather K and V in chunks, score+accumulate via matmul."""
     head_dim = all_q_T.shape[0]
     KV_CHUNK = 128
     WIN_SIZE = KV_CHUNK
@@ -1106,19 +1213,6 @@ def _gather_attn_stage_ksplit(
     transpose build drops to k_half columns, and the scoring matmul's MOVING dim
     drops k -> k_half. Total HBM traffic is UNCHANGED (each row is gathered once,
     by exactly one core) — unlike the head split, which read every row twice.
-
-    THE MERGE (two nisa.sendrecv exchanges, flash-attention style):
-      phase 1: exchange the per-head local comp max, so BOTH cores form the same
-               global max. exp() then sees the SAME shift as the unsplit body, so
-               every exp argument is bit-identical to baseline.
-      phase 2: exchange (partial V accumulator, partial exp sum); core 0 adds the
-               two partials, normalizes, de-RoPEs and writes the output.
-    Because `max` is exact in floating point and both cores compute the window
-    scores locally, the global max is bit-identical to the unsplit body. The only
-    numerical difference is the GROUPING of the fp32 sums (core0's 4 chunks +
-    core1's 4 chunks, instead of 8 chunks into one PSUM), which is a reassociation
-    of exactly the same terms — well inside the 2e-3 correctness gate but NOT
-    bit-identical, so it is graded on max_abs_diff rather than on byte equality.
     """
     head_dim = all_q_T.shape[0]
     KV_CHUNK = 128
@@ -1365,57 +1459,6 @@ def _gather_attn_stage_ksplit(
 
 
 def _split_head_fraction(T_c: int) -> tuple[int, int]:
-    """Heads core 1 takes in the fused kernel's attention phase, as (num, den).
-
-    (0, 1) means "don't split" — core 0 runs all heads, exactly as before.
-
-    Trace-time only: `T_c` is a compile-time shape, so this is a plain Python
-    branch and each seq-len compiles to the variant that measured fastest. No
-    runtime dispatch, no per-step cost.
-
-    WHY IT DEPENDS ON T_c. The work core 1 can take off core 0 here is O(k) with k
-    FIXED (1024) — a CONSTANT. What it costs is (a) a duplicated gather of the same
-    k rows (the top-k indices are head-independent, ~9.6 us of DMA) and (b) core 1
-    arriving at the second barrier LATE, because core 0 spends that time on the
-    top-k while core 1 is still finishing its O(T_c) score half. Cost (b) grows with
-    T_c while the benefit does not, so past some T_c the split stops paying at ANY
-    ratio (the obvious fix — give the late core a smaller share — was tried and
-    measured; see below).
-
-    MEASURED, medians of >=3 samples of profile total_exec_time (ms), s8192/16384/32768:
-        T_c=2048  single 0.350       even 1/2 **0.342**
-        T_c=4096  single 0.354       even 1/2 **0.347**
-        T_c=8192  single **0.355**   even 1/2  0.364      quarter 1/4  0.3635
-    At T_c=8192 BOTH split ratios lose, and shrinking core 1's share from 1/2 to 1/4
-    recovered essentially nothing (0.364 -> 0.3635, inside noise). So what fails at
-    large T_c is the MECHANISM, not the balance: no share is small enough to be worth
-    the duplicated gather.
-
-    *** iter-7 RE-TESTED THIS GATE AFTER ADDING THE TOP-K DMA SPLIT, AND IT STILL HOLDS.
-    DO NOT REMOVE IT AGAIN. *** The hypothesis was that the T_c=8192 loss came from
-    ARRIVAL SKEW (core 1 reaching the attention phase late because core 0 raced ahead
-    through the core-0-only top-k region), and that `_snake_topk_stage_2core` — which
-    splits the descriptor-bound snake reformat across both cores — would remove it.
-    Making this function return (1, 2) unconditionally was BIT-IDENTICAL
-    (max_abs_diff 1.083374e-03) and MUCH slower: total_exec {0.480, 0.474, 0.484}
-    (median 0.480, a TIGHT cluster, vs 0.355 for the same file with the gate) and
-    dma_active 0.300 -> 0.3055.
-
-    The profile says exactly why, and it refutes the skew hypothesis: the NEFF span
-    went 369.9 -> 567.5 us and EVERY engine on BOTH cores gained ~200 us of ACTIVE
-    time (c0 Tensor 891->1086, Scalar 91->288, Vector 154->352, Sync 214->426). That
-    is not a stall — it is REAL DUPLICATED WORK. Because the top-k indices are
-    head-independent, both cores gather the SAME k rows, build the SAME K^T over all
-    HD_TILES, and load the SAME window; meanwhile halving the heads saves almost
-    nothing, since M = H_BATCH goes 32 -> 16 of 128 PE output partitions and matmul
-    latency is ~insensitive to M below 128. So the duplication is pure addition.
-    (The multi-hundred-microsecond EVENT_SEMAPHOREs that appear at the end of such a
-    profile are drained engines parked at the terminal barrier — they lengthen because
-    the NEFF lengthened, they are not the cause.)
-
-    DUPLICATION, NOT SKEW, is what closes the split at T_c>4096. The top-k DMA split
-    does not change that, so this gate stays.
-    """
     if T_c <= 4096:
         return 1, 2  # even split: both cores take half the heads
     return 0, 1  # don't split — measured to lose at every ratio for T_c>4096
@@ -1539,11 +1582,6 @@ def nki_indexer_score_topk_gather_2core(
     kernel_assert(n_cores == 2, "nki_indexer_score_topk_gather_2core needs the [2] grid")
     kernel_assert(n_val >= T_c and n_val % GROUP == 0, "n_val must be >= T_c and a multiple of 16")
     kernel_assert(k_val % COMP_CHUNK == 0, "k_val must be a multiple of the gather chunk (128)")
-    # Attention-side geometry. attn_sink_in is [1, n_heads], so n_heads comes from
-    # it rather than from the (absent) index tensor's shape; S then follows from
-    # all_q_T. NOTE these are the ATTENTION head count / head_dim (32 / 512 for the
-    # evaluated per-rank config), distinct from the INDEXER's (64 / 128), which the
-    # score stage derives for itself from q_T_all / weights.
     n_heads = attn_sink_in.shape[1]
     S = all_q_T.shape[1] // n_heads
     head_dim = all_q_T.shape[0]
@@ -1609,11 +1647,6 @@ def nki_indexer_score_topk_gather_2core(
         return output
 
     if split_heads:
-        # SECOND cross-core barrier: publishes the top-k winners core 0 just wrote so
-        # BOTH cores can gather against them (core 1's trace would otherwise end at
-        # the first barrier). A second core_barrier in one kernel was previously
-        # unattested anywhere in this repo or the docs — it works, and this is the
-        # first device-validated use.
         nisa.core_barrier(data=topk_idx, cores=(0, 1))
 
     if split_heads or core_id == 0:
@@ -1654,37 +1687,6 @@ def nki_indexer_score_topk_gather_2core(
     return output
 
 
-# --------------------------------------------------------------------------
-# NKI Kernel: the indexer's q-projection GEMV, hand-written to decouple DMA burst
-# size from nc_matmul tile geometry.
-#
-# The block is DMA-bound and almost all of that DMA is projection-weight streaming,
-# so this weight matters twice over. Lowering it as a torch nn.Linear in an lnc=2
-# graph MATERIALIZES the constant at 2x its true size, and no change on the NKI
-# consumer side shrinks that -- the projection has to leave nn.Linear entirely.
-#
-# The geometry is deliberate. Making the WEIGHT the `moving` operand in wide column
-# groups cuts the declared bytes but is SLOWER: fewer, bigger matmuls each stall on
-# their own weight tile instead of pipelining. So the weight stays STATIONARY at
-# [128, 128] per matmul -- the tiling the compiler itself picks and pipelines well --
-# while arriving in a few big contiguous bursts of 16 KB/partition, comfortably over
-# the >= 4 KiB/partition DMA saturation target and far above the ~2.7 KB packets the
-# compiler's own lowering emits.
-#
-# It is also N-sharded over the [2] grid. A [1]-grid kernel inside an lnc=2 graph
-# puts this whole stream on one logical core while the sibling streams none of it,
-# where every other weight in the block is split 50/50 by the compiler's lowering.
-# Sharding costs no bytes (each core loads only its own column slice) and the bursts
-# stay above the saturation target.
-#
-# Numerics: fp32 PSUM accumulation over the k-tiles, cast to bf16 exactly once at
-# the end -- the same dataflow a compiler-lowered bf16 Linear uses.
-#
-# Output is q^T = [head_dim, n_heads], which is what the caller needs downstream.
-# The n-tiles are heads and are independent (the only reduction is over k, in-core),
-# so sharding changes only WHICH core evaluates which column -- but it does make the
-# output a buffer both cores write disjoint halves of, hence the name= below.
-# --------------------------------------------------------------------------
 @nki.jit
 def nki_indexer_qproj_gemv(wT: nl.NkiTensor, qr_in: nl.NkiTensor) -> nl.NkiTensor:
     """Indexer q-projection q = wq_b @ qr, returned TRANSPOSED as [head_dim, n_heads].
@@ -1698,14 +1700,6 @@ def nki_indexer_qproj_gemv(wT: nl.NkiTensor, qr_in: nl.NkiTensor) -> nl.NkiTenso
 
     Requires head_dim == 128 (the indexer's index_head_dim), so that an N-tile of
     128 columns is exactly one head's channel block and the PSUM tile is q^T.
-
-    N-SHARDED ACROSS THE [2] GRID (see the block comment above for why): core c
-    owns the disjoint n-tile range [c*n_ntiles/n_cores, (c+1)*n_ntiles/n_cores)
-    and DMAs only its own weight column slice, so the 25.17 MB stream is split
-    ~12.6 MB/core instead of 25.17 MB on pcore0 and 0 on pcore1. Launched `[1]`
-    it degenerates to exactly the previous single-core behaviour (core_id=0,
-    n_cores=1 -> the full n-tile range), so the two launch shapes are
-    bit-identical by construction.
     """
     core_id = nl.program_id(0)
     n_cores = nl.num_programs()
